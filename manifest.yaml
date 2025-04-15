@@ -1,0 +1,108 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kubeapp-example
+  labels:
+    app: kubeapp
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: kubeapp
+  # Выбираем стратегию RollingUpdate
+  # Устанавливаем на 1 под сверх исходного их количества при обновлении
+  # И 25% от общего количества подов могут быть недоступны при обновлении (т.е. 1 под в случае 4 активных)
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 25%
+  template:
+    metadata:
+      labels:
+        app: kubeapp
+    spec:
+      containers:
+        - name: app
+          image: kubeapp
+          resources:
+            # Задаём ресурсы для контейнера
+            # Памяти в районе 128 МБ
+            # И ЦПУ от утилизации 0.1 для времени после пиков до 0.6 в пиковую нагрузку
+            requests:
+              memory: "100Mi"
+              cpu: "100m"
+            limits:
+              memory: "150Mi"
+              cpu: "600m"
+          # Запускаем проверки готовности, спустя 10 секунд после начала инициализации
+          # Каждые 5 секунд проверяем на готовность, пока не получим ответа сервиса
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          # Запускаем проверки на живучесть, спустя 15 секунд после начала инициализации
+          livenessProbe:
+            httpGet:
+              port: 8080
+              path: /health
+            initialDelaySeconds: 15
+            periodSeconds: 10
+      affinity:
+        # Советуем kube-scheduler не разворачивать поды в одном узле
+        # Выбран preferred вместо required, т.к. в случае с required при недоступности других зон
+        # в итоге будет работать меньшее число подов, и вместо увеличенной задержки к сервису получим недостаток ресурсов
+        # и отсутствие доступа к сервису у числа пользователей
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - podAffinityTerm:
+                # Только для kubeapp используется данное правило
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - kubeapp
+                # Используем данное правило для отдельных узлов
+                topologyKey: "kubernetes.io/hostname"
+                # Указываем максимальный вес для того, чтобы новый под размещался преимущественно по правилу
+              weight: 100
+      # используется maxSkew 1 т.к. считаем, что нагрузка в разных зонах примерно одна и та же, следовательно поды должны
+      # распределяться равномерно между зонами
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: "topology.kubernetes.io/zone"
+          # При невозможности достичь равномерного распределения подов, выбираем наиболее подходящую зону из доступных,
+          # чтобы уменьшить неравномерность распределения подов
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: kubeapp
+---
+# Используем автоскейлер
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: kubeapp-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: kubeapp
+  # В случае отсутствия нагрузки (например после полудня или ночью)
+  # Уменьшаем количество подов
+  minReplicas: 2
+  # Из нагрузочных тестов понимаем, что разворачивать больше 4 подов не нужно
+  maxReplicas: 4
+  # При утилизации подами > 0.5 ресурсов процессора, разворачиваем новые поды, согласно правилам выше.
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 50
+
+
